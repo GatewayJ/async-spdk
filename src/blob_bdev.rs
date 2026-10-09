@@ -44,3 +44,20 @@ impl BlobStoreBDev {
         })
     }
 }
+
+impl BlobStoreBDev {
+    /// Enumerate unclaimed leaf devices that can host a blob store.
+    pub fn list_all() -> Vec<String> {
+        let mut names = Vec::new();
+        let mut bdev = unsafe { spdk_bdev_first_leaf() };
+        while !bdev.is_null() {
+            names.push(unsafe {
+                std::ffi::CStr::from_ptr(spdk_bdev_get_name(bdev))
+                    .to_string_lossy()
+                    .into_owned()
+            });
+            bdev = unsafe { spdk_bdev_next_leaf(bdev) };
+        }
+        names
+    }
+}

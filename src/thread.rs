@@ -136,3 +136,12 @@ pub fn init() {
 pub fn fini() {
     unsafe { spdk_thread_lib_fini() };
 }
+
+/// Reactor-local poller used by data-node request queues.
+pub type SpdkPoller = Poller;
+
+impl Poller {
+    pub fn new<F: Fn() -> bool + 'static>(f: F) -> Result<Self> {
+        Self::register(f)
+    }
+}

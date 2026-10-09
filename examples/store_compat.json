@@ -1,0 +1,24 @@
+{
+  "subsystems": [
+    {
+      "subsystem": "bdev",
+      "config": [
+        {
+          "method": "bdev_set_options",
+          "params": {
+            "bdev_io_pool_size": 1024,
+            "bdev_io_cache_size": 64
+          }
+        },
+        {
+          "method": "bdev_malloc_create",
+          "params": {
+            "name": "StoreTest",
+            "num_blocks": 131072,
+            "block_size": 512
+          }
+        }
+      ]
+    }
+  ]
+}

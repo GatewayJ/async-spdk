@@ -1,11 +1,13 @@
 //! Blob Storage System
 
-use crate::{blob_bdev::BlobStoreBDev, complete::LocalComplete, error::*};
+use crate::{blob_bdev::BlobStoreBDev, error::*};
 use log::*;
 use serde::{Deserialize, Serialize};
 use spdk_sys::*;
-use std::ffi::c_void;
+use std::convert::TryInto;
+use std::ffi::{c_void, CString};
 use std::fmt;
+use std::mem::MaybeUninit;
 use std::os::raw::c_int;
 use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
@@ -241,17 +243,6 @@ impl Default for Blob {
 unsafe impl Send for Blob {}
 unsafe impl Sync for Blob {}
 
-impl Clone for Blob {
-    fn clone(&self) -> Self {
-        Self {
-            ptr: self.ptr.clone(),
-            io_unit_size: self.io_unit_size,
-        }
-    }
-}
-
-impl Copy for Blob {}
-
 impl Blob {
     /// Get the number of clusters allocated to the blob.
     pub fn num_clusters(&self) -> u64 {
@@ -265,9 +256,13 @@ impl Blob {
     }
 
     /// Read data from a blob.
-    pub async fn read(&self, io_channel: &IoChannel, offset: u64, buf: &mut [u8]) -> Result<()> {
-        assert_eq!(buf.len() as u64 % self.io_unit_size, 0);
-        let units = buf.len() as u64 / self.io_unit_size;
+    pub async fn read(
+        &self,
+        io_channel: &IoChannel,
+        offset: u64,
+        buf: &mut [MaybeUninit<u8>],
+    ) -> Result<()> {
+        let (offset, units) = io_range(offset, buf.len() as u64, self.io_unit_size)?;
         do_async(|arg| unsafe {
             spdk_blob_io_read(
                 self.ptr,
@@ -308,8 +303,7 @@ impl Blob {
 
     /// Write data to a blob.
     pub async fn write(&self, io_channel: &IoChannel, offset: u64, buf: &[u8]) -> Result<()> {
-        assert_eq!(buf.len() as u64 % self.io_unit_size, 0);
-        let units = buf.len() as u64 / self.io_unit_size;
+        let (offset, units) = io_range(offset, buf.len() as u64, self.io_unit_size)?;
         do_async(|arg| unsafe {
             spdk_blob_io_write(
                 self.ptr,
@@ -350,8 +344,7 @@ impl Blob {
 
     /// Write zeros into area of a blob.
     pub async fn write_zero(&self, io_channel: &IoChannel, offset: u64, len: u64) -> Result<()> {
-        assert_eq!(len % self.io_unit_size, 0);
-        let units = len / self.io_unit_size;
+        let (offset, units) = io_range(offset, len, self.io_unit_size)?;
         do_async(|arg| unsafe {
             spdk_blob_io_write_zeroes(self.ptr, io_channel.ptr, offset, units, Some(callback), arg);
         })
@@ -433,18 +426,20 @@ impl Blob {
     /// Close a blob.
     ///
     /// This will automatically sync.
-    pub async fn close(self) -> Result<()> {
+    pub async fn close(mut self) -> Result<()> {
+        let ptr = std::mem::replace(&mut self.ptr, std::ptr::null_mut());
         do_async(|arg| unsafe {
-            spdk_blob_close(self.ptr, Some(callback), arg);
+            spdk_blob_close(ptr, Some(callback), arg);
         })
         .await?;
         Ok(())
     }
 
     /// Close a blob, sync API
-    pub fn close_sync(self, cb_arg: *mut c_void) -> Result<()> {
+    pub fn close_sync(mut self, cb_arg: *mut c_void) -> Result<()> {
+        let ptr = std::mem::replace(&mut self.ptr, std::ptr::null_mut());
         unsafe {
-            spdk_blob_close(self.ptr, Some(close_blob_callback), cb_arg);
+            spdk_blob_close(ptr, Some(close_blob_callback), cb_arg);
         }
         Ok(())
     }
@@ -455,13 +450,14 @@ extern "C" fn callback(arg: *mut c_void, bserrno: c_int) {
 }
 
 extern "C" fn callback_with<T>(arg: *mut c_void, bs: T, bserrno: c_int) {
-    let complete = unsafe { &mut *(arg as *mut LocalComplete<Result<T>>) };
+    let complete =
+        unsafe { Box::from_raw(arg.cast::<futures::channel::oneshot::Sender<Result<T>>>()) };
     let result = if bserrno != 0 {
         Err(SpdkError::from(bserrno))
     } else {
         Ok(bs)
     };
-    complete.complete(result);
+    let _ = complete.send(result);
 }
 
 extern "C" fn init_callback(mut arg: *mut c_void, bs: *mut spdk_blob_store, bserrno: c_int) {
@@ -551,9 +547,161 @@ extern "C" fn close_blob_callback(arg: *mut c_void, bserrno: c_int) {
     n.notify_one();
 }
 
-async fn do_async<T: Unpin>(f: impl FnOnce(*mut c_void)) -> Result<T> {
-    let complete = LocalComplete::<Result<T>>::new();
-    futures_lite::pin!(complete);
-    f(complete.as_arg());
-    complete.await
+async fn do_async<T>(f: impl FnOnce(*mut c_void)) -> Result<T> {
+    let (tx, rx) = futures::channel::oneshot::channel::<Result<T>>();
+    f(Box::into_raw(Box::new(tx)).cast());
+    rx.await.expect("SPDK completion callback dropped")
+}
+
+/// Convert byte offsets and lengths to SPDK I/O units.
+fn io_range(offset: u64, length: u64, unit: u64) -> Result<(u64, u64)> {
+    if unit == 0 || offset % unit != 0 || length % unit != 0 || offset.checked_add(length).is_none()
+    {
+        return Err(nix::errno::Errno::EINVAL.into());
+    }
+    Ok((offset / unit, length / unit))
+}
+
+pub type BlobStore = Blobstore;
+
+impl Blobstore {
+    pub fn get_io_channel(&self) -> IoChannel {
+        self.alloc_io_channel()
+            .expect("Failed to allocate blob I/O channel")
+    }
+
+    pub async fn get_super(&self) -> Result<BlobId> {
+        let id = do_async(|arg| unsafe {
+            spdk_bs_get_super(self.ptr, Some(callback_with), arg);
+        })
+        .await?;
+        Ok(BlobId { id })
+    }
+
+    pub async fn set_super(&self, blob_id: BlobId) -> Result<()> {
+        do_async(|arg| unsafe {
+            spdk_bs_set_super(self.ptr, blob_id.id, Some(callback), arg);
+        })
+        .await
+    }
+
+    /// Each yielded blob owns an open reference independent of the iterator.
+    pub fn list_blobs(&mut self) -> BlobIterator<'_> {
+        BlobIterator {
+            store: self,
+            current: std::ptr::null_mut(),
+            finished: false,
+        }
+    }
+}
+
+pub struct BlobIterator<'a> {
+    store: &'a Blobstore,
+    current: *mut spdk_blob,
+    finished: bool,
+}
+
+impl BlobIterator<'_> {
+    pub async fn next(&mut self) -> Option<Result<Blob>> {
+        if self.finished {
+            return None;
+        }
+        let previous = std::mem::replace(&mut self.current, std::ptr::null_mut());
+        let result = do_async(|arg| unsafe {
+            if previous.is_null() {
+                spdk_bs_iter_first(self.store.ptr, Some(callback_with), arg);
+            } else {
+                spdk_bs_iter_next(self.store.ptr, previous, Some(callback_with), arg);
+            }
+        })
+        .await;
+        match result {
+            Ok(ptr) => {
+                self.current = ptr;
+                let id = BlobId {
+                    id: unsafe { spdk_blob_get_id(ptr) },
+                };
+                Some(self.store.open_blob(id).await)
+            }
+            Err(err) => {
+                self.finished = true;
+                if err.errcode() == -(nix::errno::Errno::ENOENT as i32) {
+                    None
+                } else {
+                    Some(Err(err))
+                }
+            }
+        }
+    }
+}
+
+extern "C" fn close_on_drop(_: *mut c_void, errno: c_int) {
+    if errno != 0 {
+        error!("Failed to close blob: {}", errno);
+    }
+}
+
+impl Drop for BlobIterator<'_> {
+    fn drop(&mut self) {
+        if !self.current.is_null() {
+            unsafe { spdk_blob_close(self.current, Some(close_on_drop), std::ptr::null_mut()) };
+        }
+    }
+}
+
+impl Drop for Blob {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            unsafe { spdk_blob_close(self.ptr, Some(close_on_drop), std::ptr::null_mut()) };
+        }
+    }
+}
+
+impl Blob {
+    pub fn set_xattr(&mut self, name: &str, value: &[u8]) -> Result<()> {
+        let name = CString::new(name).map_err(|_| SpdkError::from(nix::errno::Errno::EINVAL))?;
+        let length = value
+            .len()
+            .try_into()
+            .map_err(|_| SpdkError::from(nix::errno::Errno::E2BIG))?;
+        SpdkError::from_retval(unsafe {
+            spdk_blob_set_xattr(self.ptr, name.as_ptr(), value.as_ptr().cast(), length)
+        })
+    }
+
+    pub fn get_xattr_value<T>(&self, name: &str, f: impl FnOnce(&[u8]) -> T) -> Result<T> {
+        let name = CString::new(name).map_err(|_| SpdkError::from(nix::errno::Errno::EINVAL))?;
+        let mut value = std::ptr::null();
+        let mut length = 0;
+        SpdkError::from_retval(unsafe {
+            spdk_blob_get_xattr_value(self.ptr, name.as_ptr(), &mut value, &mut length)
+        })?;
+        let value = if length == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(value.cast::<u8>(), length as usize) }
+        };
+        Ok(f(value))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn byte_offsets_are_converted_to_io_units() {
+        assert_eq!(io_range(8192, 4096, 4096).unwrap(), (2, 1));
+        assert_eq!(io_range(4096, 8192, 512).unwrap(), (8, 16));
+    }
+
+    #[test]
+    fn invalid_io_ranges_are_rejected() {
+        for (offset, length, unit) in [(1, 4096, 4096), (0, 1, 4096), (0, 0, 0), (u64::MAX, 1, 1)] {
+            assert_eq!(
+                io_range(offset, length, unit).unwrap_err().errcode(),
+                -(nix::errno::Errno::EINVAL as i32)
+            );
+        }
+    }
 }

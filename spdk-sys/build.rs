@@ -1,9 +1,14 @@
 use std::collections::HashSet;
 use std::env;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
+    assert_eq!(
+        env::var("CARGO_CFG_TARGET_OS").unwrap(),
+        "linux",
+        "SPDK requires a Linux build environment"
+    );
     let src = env::current_dir().unwrap().join("spdk");
 
     build_from_source();
@@ -95,28 +100,71 @@ fn build_from_source() {
     //     return;
     // }
 
-    // Initialize git submodule if necessary.
-    if !Path::new("spdk/.git").exists() {
-        let _ = Command::new("git")
-            .args(&["submodule", "update", "--init", "--recursive"])
-            .status();
+    // Fetch only the native dependencies enabled by this build.
+    if !src.join("include/spdk/blob.h").exists() {
+        let status = Command::new("git")
+            .args(["submodule", "update", "--init", "--depth", "1", "spdk"])
+            .status()
+            .expect("failed to initialize SPDK");
+        assert!(status.success(), "failed to initialize SPDK");
+    }
+    if !src.join("dpdk/meson.build").exists() {
+        let status = Command::new("git")
+            .current_dir(&src)
+            .args(["submodule", "update", "--init", "--depth", "1", "dpdk"])
+            .status()
+            .expect("failed to initialize DPDK");
+        assert!(status.success(), "failed to initialize DPDK");
     }
 
-    // configure
-    let status = Command::new("bash")
-        .current_dir(&src)
-        .arg("./configure")
-        .arg("--without-isal")
-        .status()
-        .expect("failed to configure");
+    // Recent glibc provides arc4random; avoid the legacy SPDK fallback definition.
+    let probe = PathBuf::from(env::var("OUT_DIR").unwrap()).join("arc4random_probe.c");
+    std::fs::write(
+        &probe,
+        "#include <stdlib.h>\nint main(void) { return (int)arc4random(); }\n",
+    )
+    .unwrap();
+    let has_arc4random = Command::new(env::var("CC").unwrap_or_else(|_| "cc".into()))
+        .arg("-Werror=implicit-function-declaration")
+        .arg(&probe)
+        .arg("-o")
+        .arg(probe.with_extension("bin"))
+        .output()
+        .expect("failed to probe C library")
+        .status
+        .success();
+
+    let arm = env::var("CARGO_CFG_TARGET_ARCH").unwrap() == "aarch64";
+    let mut configure = Command::new("bash");
+    configure.current_dir(&src).arg("./configure").args([
+        "--without-isal",
+        "--disable-tests",
+        "--disable-unit-tests",
+        "--disable-examples",
+        "--disable-apps",
+    ]);
+    if arm {
+        configure.arg("--target-arch=armv8-a+crc+crypto");
+    }
+    if has_arc4random {
+        configure.env(
+            "CFLAGS",
+            format!(
+                "{} -DHAVE_ARC4RANDOM",
+                env::var("CFLAGS").unwrap_or_default()
+            ),
+        );
+    }
+    let status = configure.status().expect("failed to configure");
     assert!(status.success(), "failed to configure: {}", status);
 
-    // make
-    let status = Command::new("make")
-        .current_dir(&src)
-        .arg(&format!("-j{}", env::var("NUM_JOBS").unwrap()))
-        .status()
-        .expect("failed to make");
+    let mut make = Command::new("make");
+    make.current_dir(&src)
+        .arg(format!("-j{}", env::var("NUM_JOBS").unwrap()));
+    if arm {
+        make.arg("DPDKBUILD_FLAGS=-Dplatform=generic");
+    }
+    let status = make.status().expect("failed to make");
     assert!(status.success(), "failed to make: {}", status);
 
     // link all shared libraries into 'libspdk_fat.so'
@@ -136,14 +184,33 @@ fn build_from_source() {
         let entry = e.expect("failed to read directory entry");
         let name = entry.file_name();
         let name = name.to_str().unwrap();
-        if name == "libspdk_ut_mock.a" {
+        // Initialize the storage services exposed by this crate. Network target
+        // services allocate their own pools even when no target is configured.
+        if matches!(
+            name,
+            "libspdk_ut_mock.a"
+                | "libspdk_event_iscsi.a"
+                | "libspdk_event_nvmf.a"
+                | "libspdk_event_vhost_blk.a"
+                | "libspdk_event_vhost_scsi.a"
+        ) {
             continue;
         }
         if name.starts_with("lib") && name.ends_with(".a") {
             cc.arg(entry.path());
         }
     }
-    cc.arg("-Wl,--no-whole-archive");
+    cc.arg("-Wl,--no-whole-archive").args([
+        "-laio",
+        "-lnuma",
+        "-luuid",
+        "-lcrypto",
+        "-lssl",
+        "-ldl",
+        "-lrt",
+        "-lpthread",
+        "-lm",
+    ]);
     let status = cc.status().expect("failed to generate libspdk_fat.so");
     assert!(
         status.success(),

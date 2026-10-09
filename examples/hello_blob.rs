@@ -52,7 +52,7 @@ async fn async_main() -> Result<()> {
      * Buffers for data transfer need to be allocated via SPDK. We will
      * tranfer 1 page of 4K aligned data at offset 0 in the blob.
      */
-    let mut write_buf = env::DmaBuf::alloc(io_unit_size as usize, 0x1000);
+    let mut write_buf = env::DmaBuf::alloc_zeroed(io_unit_size as usize, 0x1000);
     write_buf.as_mut().fill(0x5a);
 
     /* Now we have to allocate a channel. */
@@ -69,6 +69,7 @@ async fn async_main() -> Result<()> {
     info!("Starting read");
     blob.read(&channel, 0, read_buf.as_mut()).await?;
     info!("Finished read");
+    let read_buf = unsafe { read_buf.assume_init() };
 
     /* Now let's make sure things match. */
     if write_buf.as_ref() != read_buf.as_ref() {

@@ -30,3 +30,16 @@ impl SpdkError {
 }
 
 pub type Result<T> = std::result::Result<T, SpdkError>;
+
+impl From<nix::errno::Errno> for SpdkError {
+    fn from(errno: nix::errno::Errno) -> Self {
+        Self::from(-(errno as i32))
+    }
+}
+
+impl SpdkError {
+    /// Return the negative errno used by SPDK completion callbacks.
+    pub fn errcode(&self) -> i32 {
+        self.errno
+    }
+}

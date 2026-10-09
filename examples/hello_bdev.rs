@@ -26,7 +26,7 @@ async fn async_main() -> Result<()> {
     let balign = Bdev.get_buf_align();
     info!("Get buffer align: {}", balign);
 
-    let mut write_buf = env::DmaBuf::alloc(blk_size as usize, 0x1000);
+    let mut write_buf = env::DmaBuf::alloc_zeroed(blk_size as usize, 0x1000);
     write_buf.as_mut().fill(0x5a);
 
     let channel = bdev_desc.get_io_channel()?;
@@ -38,7 +38,7 @@ async fn async_main() -> Result<()> {
 
     info!("Finish writing");
 
-    let mut read_buf = env::DmaBuf::alloc(blk_size as usize, 0x1000);
+    let mut read_buf = env::DmaBuf::alloc_zeroed(blk_size as usize, 0x1000);
 
     bdev_desc
         .read(&channel, 0, blk_size as u64, read_buf.as_mut())
